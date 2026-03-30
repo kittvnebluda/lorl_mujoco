@@ -25,6 +25,8 @@ def train(
         "", "--load-model", "-l", help="Name of the file to load"
     ),
     device: str = typer.Option("cpu", "--device", "-d"),
+    n_envs: int = typer.Option(16, "--n_envs"),
+    random_seed: Optional[int] = typer.Option(None, "--seed"),
 ):
     train_policy(
         name=name,
@@ -32,6 +34,8 @@ def train(
         total_timesteps=total_timesteps,
         load_model=load_model,
         device=device,
+        n_envs=n_envs,
+        random_seed=random_seed,
     )
 
 

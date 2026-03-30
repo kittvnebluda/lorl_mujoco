@@ -84,11 +84,11 @@ class UnitreeGo2Env(MujocoEnv, RecordConstructorArgs):
         self,
         frame_skip: int = 10,
         reset_noise_scale: float = 0.1,
-        action_rate_cost_weight: float = 0.5,
+        action_rate_cost_weight: float = 0.01,
         contact_force_weight: float = 0.0,
-        pose_similarity_cost_weight: float = 0.2,
+        pose_similarity_cost_weight: float = 5e-2,
         z_error_cost_weight: float = 1.0,
-        z_velocity_cost_weight: float = 4.0,
+        z_velocity_cost_weight: float = 0.4,
         roll_pitch_cost_weight: float = 1.0,
         wz_tracking_reward_weight: float = 1.0,
         xy_velocity_tracking_reward_weight: float = 1.5,
@@ -152,9 +152,9 @@ class UnitreeGo2Env(MujocoEnv, RecordConstructorArgs):
         self._kd_rnd_scale = kd_random_scale
         self._main_body = 1
 
-        self.max_vx_cmd = 0.50
-        self.max_vy_cmd = 0.25
-        self.max_wz_cmd = 2.00
+        self.max_vx_cmd = 1.0
+        self.max_vy_cmd = 0.5
+        self.max_wz_cmd = 1.0
         self.max_vel_cmd = np.array(
             [self.max_vx_cmd, self.max_vy_cmd, self.max_wz_cmd],
             dtype=np.float32,
@@ -172,6 +172,7 @@ class UnitreeGo2Env(MujocoEnv, RecordConstructorArgs):
         self._vel_cmd = np.array([0.0, 0.0, 0.0], dtype=np.float32)  # vx,vy,wz
         self._z_cmd = 0.3
         self._ep_start_time = copy(self.data.time)
+        self._n_steps = 0
         self._jhome = self.init_qpos[7:]
         self._jmin = self.model.jnt_range[1:, 0]
         self._jmax = self.model.jnt_range[1:, 1]
@@ -179,6 +180,12 @@ class UnitreeGo2Env(MujocoEnv, RecordConstructorArgs):
         self._kp = nominal_kp
         self._kd = nominal_kd
         self._tb_logs = {}
+        self._vx_cmds = np.arange(-self.max_vx_cmd, self.max_vx_cmd + 0.5, 0.5)
+        self._vy_cmds = np.arange(-self.max_vy_cmd, self.max_vy_cmd + 0.25, 0.25)
+        self._wz_cmds = np.arange(-self.max_wz_cmd, self.max_wz_cmd + 0.5, 0.5)
+        self._action_rate_cost_weight_max = action_rate_cost_weight
+        self._pose_sim_cost_weight_max = pose_similarity_cost_weight
+        self._z_vel_cost_weight_max = z_velocity_cost_weight
 
         self.action_space = Box(low=-1.0, high=1.0, shape=(12,), dtype=np.float32)
 
@@ -200,21 +207,24 @@ class UnitreeGo2Env(MujocoEnv, RecordConstructorArgs):
         self.do_simulation(jtarget, self.frame_skip)
         xy_position_after = self.data.body(self._main_body).xpos[:2].copy()
 
-        xy_velocity = (xy_position_after - xy_position_before) / self.dt
-        x_velocity, y_velocity = xy_velocity
+        xy_vel = (xy_position_after - xy_position_before) / self.dt
+        x_vel, y_vel = xy_vel
 
-        reward, reward_info = self._get_reward(action, jtarget)
+        reward, reward_info = self._get_reward(action, jtarget, x_vel, y_vel)
         hs = self._get_health_state()
         obs = self._get_obs()
 
+        wz_cmd_err = self._vel_cmd[2] - self.data.qvel[5]
         info = {
-            "step/x_velocity": x_velocity,
-            "step/y_velocity": y_velocity,
+            "step/vx_cmd_error": abs(self._vel_cmd[0] - x_vel),
+            "step/vy_cmd_error": abs(self._vel_cmd[1] - y_vel),
+            "step/wz_cmd_error": abs(wz_cmd_err),
+            "step/body_height_cmd_error": abs(self._z_cmd - self.data.qpos[2]),
             **reward_info,
         }
 
-        self._tb_logs.update(reward_info)
-
+        self._n_steps += 1
+        self._tb_logs.update(info)
         self._prev_action = action.copy()
 
         if self.render_mode == "human":
@@ -297,12 +307,12 @@ class UnitreeGo2Env(MujocoEnv, RecordConstructorArgs):
         wz_err = np.sum(np.square(wz_err_vec)) / self._wz_err_scale
         return self._wz_track_rew_weight * np.exp(-wz_err)
 
-    def xy_vel_reward(self):
-        vxy_err_vec = self._vel_cmd[:2] - self.data.qvel[:2]
+    def xy_vel_reward(self, x_vel, y_vel):
+        vxy_err_vec = self._vel_cmd[:2] - np.array([x_vel, y_vel])
         vxy_err = np.sum(np.square(vxy_err_vec)) / self._vxy_err_scale
         return self._vxy_track_rew_weight * np.exp(-vxy_err)
 
-    def _get_reward(self, action, jtarget):
+    def _get_reward(self, action, jtarget, x_vel, y_vel):
         qpos = self.data.qpos
         qvel = self.data.qvel
         r, p, _ = quat2euler(qpos[3:7])
@@ -315,7 +325,7 @@ class UnitreeGo2Env(MujocoEnv, RecordConstructorArgs):
         rp_cost = self._roll_pitch_cost_weight * (r**2 + p**2)
 
         wz_reward = self.wz_reward()
-        xy_vel_reward = self.xy_vel_reward()
+        xy_vel_reward = self.xy_vel_reward(x_vel, y_vel)
 
         costs = ac_cost + ps_cost + ze_cost + co_cost + zv_cost + rp_cost
         rewards = wz_reward + xy_vel_reward
@@ -327,7 +337,7 @@ class UnitreeGo2Env(MujocoEnv, RecordConstructorArgs):
             "reward/action_rate": -ac_cost,
             "reward/pose_similarity": -ps_cost,
             "reward/contact": -co_cost,
-            "reward/z_tracking": -ze_cost,
+            "reward/z_tracking_error": -ze_cost,
             "reward/z_velocity": -zv_cost,
             "reward/roll_pitch": -rp_cost,
         }
@@ -364,8 +374,13 @@ class UnitreeGo2Env(MujocoEnv, RecordConstructorArgs):
         self._kd = self._nominal_kd * scale_kd
 
         # Randomize command velocity and body height
-        self._vel_cmd = self.np_random.uniform(
-            -self.max_vel_cmd, self.max_vel_cmd, (3,)
+        self._vel_cmd = np.array(
+            (
+                self.np_random.choice(self._vx_cmds, shuffle=False),
+                self.np_random.choice(self._vy_cmds, shuffle=False),
+                self.np_random.choice(self._wz_cmds, shuffle=False),
+            ),
+            dtype=np.float32,
         )
         self._z_cmd = self.np_random.uniform(self.min_z_cmd, self.max_z_cmd)
 
@@ -390,3 +405,24 @@ class UnitreeGo2Env(MujocoEnv, RecordConstructorArgs):
             "",
         ]
         print("\n".join(lines))
+
+    def set_pose_similarity_cost_weight(self, weight: float):
+        weight = min(weight, self._pose_sim_cost_weight_max)
+        self._pose_sim_cost_weight = float(weight)
+
+    def get_pose_similarity_cost_weight(self):
+        return self._pose_sim_cost_weight
+
+    def set_action_rate_cost_weight(self, weight: float):
+        weight = min(weight, self._action_rate_cost_weight_max)
+        self._action_rate_cost_weight = float(weight)
+
+    def get_action_rate_cost_weight(self):
+        return self._action_rate_cost_weight
+
+    def set_z_vel_cost_weight(self, weight: float):
+        weight = min(weight, self._z_vel_cost_weight_max)
+        self._z_vel_cost_weight = float(weight)
+
+    def get_z_vel_cost_weight(self):
+        return self._z_vel_cost_weight
